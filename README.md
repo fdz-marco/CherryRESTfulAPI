@@ -16,105 +16,74 @@
 
 require_once 'Cherry_RESTful_API_Handler.php';
 
+// 1. Configure (setBasePath must come before init)
+CherryRESTfulAPI::setBasePath('');                          // set '/api' if in a subfolder
 CherryRESTfulAPI::init();
-CherryRESTfulAPI::setAuthToken(getenv('API_SECRET')); // load from env, never hard-code
+CherryRESTfulAPI::setAuthToken(getenv('API_SECRET'));       // load from env, never hard-code
+CherryRESTfulAPI::setDebugMode(getenv('APP_DEBUG') === 'true');
+CherryRESTfulAPI::enableCORS('https://app.example.com');   // or '*' for any origin
 
+// 2. Register routes
 CherryRESTfulAPI::addRoute('GET', '/users', function (): array {
-    return ['users' => []];
+    $page = (int) CherryRESTfulAPI::getParam('page', 1);   // ?page=2
+    return ['users' => [], 'page' => $page];
 }, requiresAuth: true);
 
 CherryRESTfulAPI::addRoute('GET', '/users/{id}', function (string $id): array {
     return ['id' => $id];
 });
 
-CherryRESTfulAPI::addRoute('POST', '/users', function (): array {
+CherryRESTfulAPI::addRoute('POST', '/users', function (): void {
     $body = CherryRESTfulAPI::getInput();
-    return ['created' => true, 'name' => $body['name'] ?? null];
+    if (empty($body['name'])) {
+        CherryRESTfulAPI::respond(422, ['error' => 'name is required']);
+    }
+    CherryRESTfulAPI::respond(201, ['created' => true]);    // custom status code
 });
 
 CherryRESTfulAPI::addRoute('PUT', '/users/{id}', function (string $id): array {
     return ['updated' => true, 'id' => $id];
 }, requiresAuth: true);
 
-CherryRESTfulAPI::addRoute('DELETE', '/users/{id}', function (string $id): array {
-    return ['deleted' => true, 'id' => $id];
+CherryRESTfulAPI::addRoute('DELETE', '/users/{id}', function (string $id): void {
+    CherryRESTfulAPI::respond(204);                         // 204 No Content
 }, requiresAuth: true);
 
+// 3. Dispatch
 CherryRESTfulAPI::processRequest();
 ```
 
-For the full API reference, configuration options, security details, and best practices see **[DOCUMENTATION.md](DOCUMENTATION.md)**.
+For the full API reference, all configuration options, security details, and best practices see **[DOCUMENTATION.md](DOCUMENTATION.md)**.
+
+---
+
+## Environment Setup
+
+Copy `.env.example` to `.env` and fill in the values. PHP does not load `.env` files natively — see the comments inside `.env.example` for the three supported approaches (phpdotenv, Apache `SetEnv`, Nginx `fastcgi_param`).
+
+```bash
+cp .env.example .env
+```
 
 ---
 
 ## Server Configuration
 
-### Apache — root folder
+Production-ready config files are in [server-configs/](server-configs/).
 
-```apache
-<IfModule mod_rewrite.c>
-    RewriteEngine On
-    RewriteCond %{REQUEST_FILENAME} !-f
-    RewriteCond %{REQUEST_FILENAME} !-d
-    RewriteRule ^(.*)$ index.php [QSA,L]
-</IfModule>
-```
+| File | Use |
+|------|-----|
+| [server-configs/apache/.htaccess](server-configs/apache/.htaccess) | Apache — API at root. Copy to your project root. |
+| [server-configs/apache/subfolder.htaccess](server-configs/apache/subfolder.htaccess) | Apache — API in a subfolder (e.g. `/api/`). Rename to `.htaccess` and copy to your subfolder. |
+| [server-configs/apache/virtualhost.conf](server-configs/apache/virtualhost.conf) | Apache — full virtual host with SSL, PHP-FPM, and hardening headers. |
+| [server-configs/nginx/site.conf](server-configs/nginx/site.conf) | Nginx — API at root. Full server block with SSL and PHP-FPM. |
+| [server-configs/nginx/site-subfolder.conf](server-configs/nginx/site-subfolder.conf) | Nginx — API in a subfolder. Pair with `setBasePath()`. |
 
-### Apache — sub-folder (e.g. `/api`)
-
-```apache
-<IfModule mod_rewrite.c>
-    RewriteEngine On
-    RewriteBase /api/
-    RewriteCond %{REQUEST_FILENAME} !-f
-    RewriteCond %{REQUEST_FILENAME} !-d
-    RewriteRule ^(.*)$ index.php [QSA,L]
-</IfModule>
-```
-
-### Nginx — root folder
-
-```nginx
-server {
-    listen 80;
-    server_name yourdomain.com;
-    root /path/to/your/project;
-    index index.php;
-
-    location / {
-        try_files $uri /index.php;
-    }
-
-    location ~ \.php$ {
-        include snippets/fastcgi-php.conf;
-        fastcgi_pass unix:/var/run/php/php8.1-fpm.sock;
-        fastcgi_param SCRIPT_FILENAME $document_root$fastcgi_script_name;
-        include fastcgi_params;
-    }
-}
-```
-
-### Nginx — sub-folder (e.g. `/api`)
-
-```nginx
-server {
-    listen 80;
-    server_name yourdomain.com;
-    root /path/to/your/project;
-    index index.php;
-
-    location /api/ {
-        try_files $uri /api/index.php;
-    }
-
-    location ~ \.php$ {
-        include snippets/fastcgi-php.conf;
-        fastcgi_pass unix:/var/run/php/php8.1-fpm.sock;
-        fastcgi_param SCRIPT_FILENAME $document_root$fastcgi_script_name;
-        include fastcgi_params;
-    }
-}
-```
+All configs include:
+- HTTP → HTTPS redirect
+- TLS 1.2 / 1.3 only
+- Block access to `.env`, `.git`, `composer.json`
+- Security headers (`HSTS`, `X-Frame-Options`, etc.)
 
 ---
 

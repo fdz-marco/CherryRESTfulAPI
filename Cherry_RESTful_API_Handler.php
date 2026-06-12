@@ -9,7 +9,7 @@ declare(strict_types=1);
 ##  @author      Marco Fernandez                                   ##
 ##  @link        marcofdz.com / glitcher.dev / inventtoo.com       ##
 ##  @link        https://github.com/fdz-marco                      ##
-##  @version     0.1.0 (2026.06.11)                                ##
+##  @version     0.2.0 (2026.06.12)                                ##
 ##  @license     https://opensource.org/licenses/MIT               ##
 ##  @copyright   2024-2026 marcofdz.com / glitcher.dev / inventtoo.com  ##
 ##                                                                 ##
@@ -21,10 +21,22 @@ class CherryRESTfulAPI {
     private static array  $_endpoint      = [];
     private static ?array $_input         = null;
     private static array  $_routes        = [];
+
+    // Auth
     private static string $_authToken     = '';
+
+    // Input
     private static int    $_maxInputSize  = 1_048_576; // 1 MB default
+
+    // CORS
     private static bool   $_corsEnabled   = false;
     private static array  $_corsOrigins   = [];
+
+    // Routing
+    private static string $_basePath      = '';
+
+    // Error handling
+    private static bool   $_debugMode     = false;
 
     /***
     =========================================================
@@ -35,13 +47,21 @@ class CherryRESTfulAPI {
     /**
      * Initialize the RESTful API Handler.
      *
-     * Reads the HTTP method, parses the request URI into endpoint segments,
-     * and decodes the request body. Must be called before addRoute() and
+     * Reads the HTTP method, parses the request URI into endpoint segments
+     * (stripping the configured base path when set), and decodes the request
+     * body. Must be called after setBasePath() and before addRoute() /
      * processRequest().
      */
     public static function init(): void {
         self::$_requestMethod = strtoupper($_SERVER['REQUEST_METHOD'] ?? 'GET');
+
         $path = trim(parse_url($_SERVER['REQUEST_URI'] ?? '/', PHP_URL_PATH), '/');
+
+        // Strip the configured base path so routes are always relative.
+        if (self::$_basePath !== '' && str_starts_with($path, self::$_basePath)) {
+            $path = trim(substr($path, strlen(self::$_basePath)), '/');
+        }
+
         self::$_endpoint = $path !== '' ? explode('/', $path) : [];
         self::$_input    = self::parseInput();
     }
@@ -53,7 +73,7 @@ class CherryRESTfulAPI {
      * Falls back to $_POST when the body is absent. Returns null and does NOT
      * fall back to $_POST when the body is present but contains invalid JSON,
      * preventing silent data substitution. Sends 413 and terminates if the
-     * payload exceeds the configured limit.
+     * payload exceeds the configured size limit.
      */
     private static function parseInput(): ?array {
         $raw = file_get_contents('php://input', false, null, 0, self::$_maxInputSize + 1);
@@ -86,6 +106,22 @@ class CherryRESTfulAPI {
     }
 
     /**
+     * Return all query-string parameters ($_GET).
+     */
+    public static function getQueryParams(): array {
+        return $_GET;
+    }
+
+    /**
+     * Return a single query-string parameter by key, or $default when absent.
+     *
+     * @param mixed $default  Value returned when the key is not present.
+     */
+    public static function getParam(string $key, mixed $default = null): mixed {
+        return $_GET[$key] ?? $default;
+    }
+
+    /**
      * Set the maximum accepted request body size in bytes.
      *
      * Requests with a body larger than this limit receive a 413 response.
@@ -102,11 +138,23 @@ class CherryRESTfulAPI {
     ***/
 
     /**
+     * Set a URL base path that is stripped from every request before matching.
+     *
+     * Use this when the API lives in a sub-directory, e.g. '/api' or '/v1'.
+     * Must be called before init().
+     */
+    public static function setBasePath(string $basePath): void {
+        self::$_basePath = trim($basePath, '/');
+    }
+
+    /**
      * Register a route.
      *
      * @param string   $request_method  HTTP verb (GET, POST, PUT, PATCH, DELETE, …).
      * @param string   $path            URI path; use {name} for dynamic segments, e.g. /users/{id}.
-     * @param callable $handler         Invoked on match; receives dynamic segments as positional arguments.
+     * @param callable $handler         Invoked on match; receives dynamic segments as positional
+     *                                  string arguments. May return any JSON-encodable value, or
+     *                                  call CherryRESTfulAPI::respond() to send a custom status.
      * @param bool     $requiresAuth    When true, a valid Bearer token is required (see setAuthToken()).
      */
     public static function addRoute(
@@ -173,7 +221,7 @@ class CherryRESTfulAPI {
             return false;
         }
         $headers  = self::getAllRequestHeaders();
-        // Normalise to avoid case sensitivity differences across web servers.
+        // Normalise to avoid case-sensitivity differences across web servers.
         $received = $headers['Authorization'] ?? $headers['authorization'] ?? '';
         return hash_equals('Bearer ' . self::$_authToken, $received);
     }
@@ -232,7 +280,7 @@ class CherryRESTfulAPI {
      * For a wildcard allowlist, Access-Control-Allow-Origin is set to '*'.
      * For an explicit allowlist, the request's Origin is reflected only when
      * it appears in the list, and a Vary: Origin header is added so shared
-     * caches do not serve the wrong origin's response to another client.
+     * caches do not serve one origin's response to a different origin.
      */
     private static function sendCORSHeaders(): void {
         if (!self::$_corsEnabled) {
@@ -254,6 +302,25 @@ class CherryRESTfulAPI {
 
     /***
     =========================================================
+    Error Handling
+    =========================================================
+    ***/
+
+    /**
+     * Enable or disable debug mode.
+     *
+     * In debug mode, unhandled exceptions thrown by route handlers are
+     * serialized into the 500 response (message, file, line). In production,
+     * only a generic "Internal server error" message is returned.
+     *
+     * Never enable debug mode in a public-facing environment.
+     */
+    public static function setDebugMode(bool $debug): void {
+        self::$_debugMode = $debug;
+    }
+
+    /***
+    =========================================================
     Process Request / Response
     =========================================================
     ***/
@@ -262,9 +329,17 @@ class CherryRESTfulAPI {
      * Dispatch the incoming request to the first matching registered route.
      *
      * Emits security and CORS headers on every response. Handles OPTIONS
-     * preflight with 204. Iterates registered routes; on a match the handler
-     * is called with URL path params as positional arguments and its return
-     * value is JSON-encoded with status 200. An unmatched request gets 404.
+     * preflight with 204 and HEAD requests by matching against GET routes
+     * without invoking the handler or sending a body.
+     *
+     * Route matching respects registration order; the first match wins.
+     * When a path matches but no registered method does, a 405 is returned
+     * with an Allow header listing the supported methods. Unmatched paths
+     * receive 404.
+     *
+     * Exceptions thrown by handlers are caught: in debug mode the exception
+     * detail is included in the 500 response; in production only a generic
+     * message is returned.
      */
     public static function processRequest(): void {
         self::sendSecurityHeaders();
@@ -275,30 +350,91 @@ class CherryRESTfulAPI {
             self::sendResponse(204, null);
         }
 
-        $endpointPath = implode('/', self::$_endpoint);
+        // HEAD is handled by matching GET routes and suppressing the body.
+        $isHead        = self::$_requestMethod === 'HEAD';
+        $effectiveMethod = $isHead ? 'GET' : self::$_requestMethod;
+
+        $endpointPath    = implode('/', self::$_endpoint);
+        $pathMatchedMethods = [];
 
         foreach (self::$_routes as $route) {
-            if ($route['request_method'] !== self::$_requestMethod) {
+            $pathMatches = preg_match(
+                self::buildRouteRegex($route['path']),
+                $endpointPath,
+                $matches
+            );
+
+            if (!$pathMatches) {
                 continue;
             }
-            if (!preg_match(self::buildRouteRegex($route['path']), $endpointPath, $matches)) {
+
+            // Track which methods are registered for this path (for 405).
+            $pathMatchedMethods[] = $route['request_method'];
+
+            if ($route['request_method'] !== $effectiveMethod) {
                 continue;
             }
+
             array_shift($matches); // Remove the full-match entry; keep capture groups only.
 
             if ($route['requiresAuth'] && !self::isAuthenticated()) {
                 self::sendResponse(401, ['error' => 'Unauthorized']);
             }
 
-            $result = call_user_func_array($route['handler'], $matches);
+            // HEAD: path exists — return 200 with no body, no handler call.
+            if ($isHead) {
+                self::sendResponse(200, null);
+            }
+
+            try {
+                $result = call_user_func_array($route['handler'], $matches);
+            } catch (Throwable $e) {
+                // Never let an unhandled exception expose a raw PHP error to the client.
+                self::sendResponse(500, self::$_debugMode
+                    ? ['error' => $e->getMessage(), 'file' => $e->getFile(), 'line' => $e->getLine()]
+                    : ['error' => 'Internal server error']
+                );
+            }
+
             self::sendResponse(200, $result);
+        }
+
+        // Path was recognised but the method is not registered for it.
+        if (!empty($pathMatchedMethods)) {
+            $allowed = array_unique($pathMatchedMethods);
+            // HEAD is implicitly supported wherever GET is.
+            if (in_array('GET', $allowed, true)) {
+                $allowed[] = 'HEAD';
+            }
+            sort($allowed);
+            header('Allow: ' . implode(', ', $allowed));
+            self::sendResponse(405, ['error' => 'Method not allowed']);
         }
 
         self::sendResponse(404, ['error' => 'Not found']);
     }
 
     /**
-     * Emit security hardening headers included on every API response.
+     * Send a response with a custom HTTP status code from inside a handler.
+     *
+     * Calling this from a handler bypasses the default 200 status that
+     * processRequest() would otherwise use. Terminates execution.
+     *
+     * Example:
+     *   CherryRESTfulAPI::addRoute('POST', '/users', function (): void {
+     *       // ... create user ...
+     *       CherryRESTfulAPI::respond(201, ['id' => 42]);
+     *   });
+     *
+     * @param int   $statusCode  HTTP status code to send.
+     * @param mixed $data        JSON-encodable response body, or null for an empty body.
+     */
+    public static function respond(int $statusCode, mixed $data = null): never {
+        self::sendResponse($statusCode, $data);
+    }
+
+    /**
+     * Emit hardening headers included on every API response.
      *
      * - X-Content-Type-Options: nosniff — prevents MIME-type sniffing.
      * - X-Frame-Options: DENY       — blocks embedding in iframes.
@@ -315,8 +451,8 @@ class CherryRESTfulAPI {
     /**
      * Serialize $response as JSON, set the HTTP status code, and terminate.
      *
-     * Passing null for $response emits an empty body, which is appropriate for
-     * responses such as 204 No Content or 304 Not Modified.
+     * Passing null for $response emits an empty body (suitable for 204 No
+     * Content, 304 Not Modified, and HEAD responses).
      *
      * @param int   $statusCode  HTTP status code to send.
      * @param mixed $response    Value to JSON-encode, or null for an empty body.
